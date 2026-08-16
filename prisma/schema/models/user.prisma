@@ -1,0 +1,20 @@
+model User {
+    id         String @id @default(uuid())
+    firebaseId String @unique
+
+    fullName  String
+    email     String  @unique
+    username  String? @unique
+    phone     String?
+    // role UserRole
+    avatarUrl String?
+
+    createdAt DateTime @default(now())
+    updatedAt DateTime @updatedAt
+
+    //   Upcoming realations 
+    // appoinments
+
+} 
+
+

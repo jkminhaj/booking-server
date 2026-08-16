@@ -3,3 +3,12 @@ node_modules/
 
 # Environment Variables
 .env
+
+# Generated Prisma Client
+/src/generated/prisma/
+
+# Editor / AI tool config
+.vscode/
+.windsurf/
+.claude/
+.agents/

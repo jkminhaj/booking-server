@@ -1,0 +1,2582 @@
+openapi: 3.1.0
+info:
+  title: Booking SaaS API
+  version: "1.0.0"
+  description: |
+    Multi-tenant booking API for barbershops, salons, gyms, and clinics.
+
+    ## Auth
+    Two-token JWT flow. `POST /auth/login` (or `/auth/register`) returns an
+    **access token** in the response body — send it as `Authorization: Bearer <token>`
+    on every authenticated request — and sets a **refresh token** as an httpOnly
+    cookie. When the access token expires (15 min), call `POST /auth/refresh`
+    (browser sends the cookie automatically) to get a new one.
+
+    ## Envelope
+    Every response is `{ "success": true, "data": ... }` or
+    `{ "success": false, "error": { "code", "message" } }`. Paginated list
+    endpoints add a `meta: { page, limit, total }` object alongside `data`.
+
+    ## Multi-tenancy
+    Everything under a business is scoped automatically from your access
+    token — there is no `businessId` to pass yourself, and you cannot see or
+    modify another business's data.
+
+    ## Rate limits
+    General: 300 req / 15 min per IP. Login/register: 10 (resp. 5) per
+    15 min–1 hour. Public booking creation & payment-intent creation: 30/hour.
+  contact:
+    name: Rixelio
+servers:
+  - url: http://localhost:3000/api
+    description: Local development
+tags:
+  - name: Auth
+    description: Registration, login, session refresh, and your own profile.
+  - name: Business
+    description: The current tenant's own business record.
+  - name: Staff
+    description: Team members (users) belonging to the business.
+  - name: Customers
+    description: A business's contact records for the people it serves.
+  - name: Service Categories
+    description: Groupings used to organize services on the booking page.
+  - name: Services
+    description: The bookable services a business offers.
+  - name: Staff Services
+    description: Which staff perform which services, with optional per-staff overrides.
+  - name: Working Hours
+    description: The recurring weekly schedule, business-wide or per staff member.
+  - name: Schedule Overrides
+    description: One-off exceptions to working hours (holidays, shortened days).
+  - name: Blocked Times
+    description: Ad-hoc unavailable periods (breaks, meetings, personal time).
+  - name: Availability
+    description: The scheduling engine — read-only slot lookups for the dashboard.
+  - name: Appointments
+    description: Bookings, their lifecycle, and conflict-protected creation.
+  - name: Public Booking
+    description: Unauthenticated endpoints powering the customer-facing booking page.
+  - name: Payments
+    description: Payment records, Stripe payment intents, refunds, and the webhook.
+  - name: Dashboard
+    description: Aggregate stats for the business (manager role and up).
+  - name: Health
+    description: Service and database status.
+security:
+  - bearerAuth: []
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: Access token from /auth/login, /auth/register, or /auth/refresh.
+
+  parameters:
+    IdParam:
+      name: id
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    PageParam:
+      name: page
+      in: query
+      schema: { type: integer, minimum: 1, default: 1 }
+    LimitParam:
+      name: limit
+      in: query
+      schema: { type: integer, minimum: 1, maximum: 100, default: 20 }
+
+  schemas:
+    SuccessEnvelope:
+      type: object
+      properties:
+        success: { type: boolean, example: true }
+
+    PaginationMeta:
+      type: object
+      properties:
+        page: { type: integer, example: 1 }
+        limit: { type: integer, example: 20 }
+        total: { type: integer, example: 42 }
+
+    Error:
+      type: object
+      properties:
+        success: { type: boolean, example: false }
+        error:
+          type: object
+          properties:
+            code: { type: string, example: VALIDATION_ERROR }
+            message: { type: string, example: Validation failed }
+            details:
+              type: array
+              items:
+                type: object
+                properties:
+                  path: { type: string, example: body.email }
+                  message: { type: string, example: Invalid email }
+
+    MessageOnly:
+      type: object
+      properties:
+        success: { type: boolean, example: true }
+        data:
+          type: object
+          properties:
+            message: { type: string }
+
+    Role:
+      type: string
+      enum: [OWNER, ADMIN, MANAGER, STAFF, RECEPTIONIST]
+    AppointmentStatus:
+      type: string
+      enum: [PENDING, CONFIRMED, COMPLETED, CANCELLED, NO_SHOW]
+    PaymentStatus:
+      type: string
+      enum: [PENDING, PAID, FAILED, REFUNDED, PARTIALLY_REFUNDED]
+    PaymentMethod:
+      type: string
+      enum: [CARD, CASH, OTHER]
+
+    Business:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string, example: Apex Barbers }
+        slug: { type: string, example: apex-barbers }
+        timezone: { type: string, example: Europe/London }
+        email: { type: string, format: email }
+        phone: { type: string, nullable: true }
+        isActive: { type: boolean }
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }
+
+    PublicBusiness:
+      type: object
+      description: The subset of Business fields exposed on the public booking page.
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        slug: { type: string }
+        timezone: { type: string }
+        email: { type: string, format: email }
+        phone: { type: string, nullable: true }
+
+    User:
+      type: object
+      description: A staff member. Never includes passwordHash, tokenVersion, or firebaseId.
+      properties:
+        id: { type: string, format: uuid }
+        businessId: { type: string, format: uuid }
+        name: { type: string }
+        email: { type: string, format: email }
+        phone: { type: string, nullable: true }
+        image: { type: string, nullable: true }
+        role: { $ref: '#/components/schemas/Role' }
+        isActive: { type: boolean }
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }
+
+    Customer:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        businessId: { type: string, format: uuid }
+        name: { type: string }
+        email: { type: string, format: email, nullable: true }
+        phone: { type: string, nullable: true }
+        notes: { type: string, nullable: true }
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }
+
+    ServiceCategory:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        businessId: { type: string, format: uuid }
+        name: { type: string }
+        description: { type: string, nullable: true }
+        isActive: { type: boolean }
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }
+
+    Service:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        businessId: { type: string, format: uuid }
+        categoryId: { type: string, format: uuid, nullable: true }
+        name: { type: string }
+        description: { type: string, nullable: true }
+        durationMinutes: { type: integer, example: 45 }
+        bufferMinutes: { type: integer, example: 10 }
+        price: { type: string, example: "30.00", description: Decimal, serialized as a string. }
+        isActive: { type: boolean }
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }
+
+    StaffService:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        staffId: { type: string, format: uuid }
+        serviceId: { type: string, format: uuid }
+        customPrice: { type: string, nullable: true }
+        customDuration: { type: integer, nullable: true }
+        isActive: { type: boolean }
+
+    WorkingHours:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        businessId: { type: string, format: uuid }
+        staffId: { type: string, format: uuid, nullable: true, description: "null = business-level default" }
+        dayOfWeek: { type: integer, minimum: 0, maximum: 6, description: "0 = Sunday .. 6 = Saturday" }
+        startTime: { type: string, example: "09:00" }
+        endTime: { type: string, example: "17:00" }
+
+    ScheduleOverride:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        businessId: { type: string, format: uuid }
+        staffId: { type: string, format: uuid, nullable: true }
+        date: { type: string, example: "2026-12-25" }
+        isClosed: { type: boolean }
+        startTime: { type: string, nullable: true, example: "10:00" }
+        endTime: { type: string, nullable: true, example: "15:00" }
+        reason: { type: string, nullable: true, example: Christmas }
+
+    BlockedTime:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        businessId: { type: string, format: uuid }
+        staffId: { type: string, format: uuid, nullable: true, description: "null = business-wide" }
+        startAt: { type: string, format: date-time }
+        endAt: { type: string, format: date-time }
+        reason: { type: string, nullable: true }
+
+    Appointment:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        businessId: { type: string, format: uuid }
+        customerId: { type: string, format: uuid }
+        staffId: { type: string, format: uuid }
+        serviceId: { type: string, format: uuid }
+        startAt: { type: string, format: date-time }
+        endAt: { type: string, format: date-time }
+        status: { $ref: '#/components/schemas/AppointmentStatus' }
+        priceAtBooking: { type: string, example: "30.00" }
+        notes: { type: string, nullable: true }
+        cancelledAt: { type: string, format: date-time, nullable: true }
+        cancellationReason: { type: string, nullable: true }
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }
+        customer: { $ref: '#/components/schemas/Customer' }
+        staff:
+          type: object
+          properties:
+            id: { type: string, format: uuid }
+            name: { type: string }
+        service: { $ref: '#/components/schemas/Service' }
+
+    Payment:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        appointmentId: { type: string, format: uuid }
+        amount: { type: string, example: "30.00" }
+        status: { $ref: '#/components/schemas/PaymentStatus' }
+        method: { $ref: '#/components/schemas/PaymentMethod' }
+        transactionRef: { type: string, nullable: true, description: Stripe PaymentIntent id for CARD payments. }
+        paidAt: { type: string, format: date-time, nullable: true }
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }
+
+    AvailabilityResult:
+      type: object
+      properties:
+        date: { type: string, example: "2026-09-01" }
+        service:
+          type: object
+          properties:
+            id: { type: string, format: uuid }
+            name: { type: string }
+            durationMinutes: { type: integer }
+            bufferMinutes: { type: integer }
+        staff:
+          type: array
+          items:
+            type: object
+            properties:
+              staffId: { type: string, format: uuid }
+              name: { type: string }
+              slots:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    startAt: { type: string, format: date-time }
+                    endAt: { type: string, format: date-time }
+
+  responses:
+    Unauthorized:
+      description: Missing, invalid, or expired access token.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example: { success: false, error: { code: UNAUTHORIZED, message: Invalid or expired access token } }
+    Forbidden:
+      description: Authenticated, but not allowed to perform this action.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example: { success: false, error: { code: FORBIDDEN, message: You do not have permission to perform this action } }
+    NotFound:
+      description: No such resource in this business.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example: { success: false, error: { code: NOT_FOUND, message: Resource not found } }
+    ValidationError:
+      description: Request body, query, or params failed validation.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example: { success: false, error: { code: VALIDATION_ERROR, message: Validation failed, details: [{ path: "body.email", message: Invalid email }] } }
+    Conflict:
+      description: The request conflicts with the resource's current state (duplicate, already booked, etc).
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    TooManyRequests:
+      description: Rate limit exceeded.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example: { success: false, error: { code: TOO_MANY_REQUESTS, message: Too many requests. Please try again later. } }
+
+paths:
+  /auth/register:
+    post:
+      tags: [Auth]
+      summary: Register a new business + its owner
+      description: Creates a Business and its first User (role OWNER) together, in one transaction. Sets the refresh-token cookie.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [business, owner]
+              properties:
+                business:
+                  type: object
+                  required: [name, email]
+                  properties:
+                    name: { type: string, minLength: 2 }
+                    email: { type: string, format: email }
+                    phone: { type: string }
+                    timezone: { type: string, example: Europe/London, description: Defaults to Europe/London if omitted. }
+                owner:
+                  type: object
+                  required: [name, email, password]
+                  properties:
+                    name: { type: string, minLength: 2 }
+                    email: { type: string, format: email }
+                    password: { type: string, minLength: 8, format: password }
+                    phone: { type: string }
+      responses:
+        '201':
+          description: Created
+          headers:
+            Set-Cookie: { schema: { type: string }, description: "refreshToken=...; HttpOnly; Path=/api/auth" }
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          accessToken: { type: string }
+                          user: { $ref: '#/components/schemas/User' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /auth/login:
+    post:
+      tags: [Auth]
+      summary: Log in
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, password]
+              properties:
+                email: { type: string, format: email }
+                password: { type: string, format: password }
+      responses:
+        '200':
+          description: OK
+          headers:
+            Set-Cookie: { schema: { type: string } }
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          accessToken: { type: string }
+                          user: { $ref: '#/components/schemas/User' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /auth/refresh:
+    post:
+      tags: [Auth]
+      summary: Exchange the refresh-token cookie for a new access token
+      description: Reads the httpOnly refreshToken cookie (no Authorization header needed) and rotates it.
+      security: []
+      responses:
+        '200':
+          description: OK
+          headers:
+            Set-Cookie: { schema: { type: string } }
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          accessToken: { type: string }
+                          user: { $ref: '#/components/schemas/User' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /auth/logout:
+    post:
+      tags: [Auth]
+      summary: Log out
+      description: Invalidates every refresh token issued before now (bumps tokenVersion) and clears the cookie.
+      security: []
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json: { schema: { $ref: '#/components/schemas/MessageOnly' } }
+
+  /auth/me:
+    get:
+      tags: [Auth]
+      summary: Get your own user + business
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/User' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /auth/profile:
+    patch:
+      tags: [Auth]
+      summary: Update your own name / phone / image
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name: { type: string, minLength: 2 }
+                phone: { type: string }
+                image: { type: string, format: uri }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/User' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /auth/password:
+    patch:
+      tags: [Auth]
+      summary: Change your own password
+      description: Also bumps tokenVersion — you'll be logged out on every other device.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [currentPassword, newPassword]
+              properties:
+                currentPassword: { type: string, format: password }
+                newPassword: { type: string, minLength: 8, format: password }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json: { schema: { $ref: '#/components/schemas/MessageOnly' } }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+  /business:
+    get:
+      tags: [Business]
+      summary: Get the current business
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties: { data: { $ref: '#/components/schemas/Business' } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+    patch:
+      tags: [Business]
+      summary: Update business info
+      description: Requires OWNER or ADMIN.
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name: { type: string, minLength: 2 }
+                email: { type: string, format: email }
+                phone: { type: string }
+                timezone: { type: string }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties: { data: { $ref: '#/components/schemas/Business' } }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /business/status:
+    patch:
+      tags: [Business]
+      summary: Activate or deactivate the business
+      description: Requires OWNER.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [isActive]
+              properties: { isActive: { type: boolean } }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties: { data: { $ref: '#/components/schemas/Business' } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /users:
+    get:
+      tags: [Staff]
+      summary: List staff
+      parameters:
+        - $ref: '#/components/parameters/PageParam'
+        - $ref: '#/components/parameters/LimitParam'
+        - name: role
+          in: query
+          schema: { $ref: '#/components/schemas/Role' }
+        - name: isActive
+          in: query
+          schema: { type: boolean }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data: { type: array, items: { $ref: '#/components/schemas/User' } }
+                      meta: { $ref: '#/components/schemas/PaginationMeta' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+    post:
+      tags: [Staff]
+      summary: Add a staff member
+      description: Requires OWNER, ADMIN, or MANAGER. `role` cannot be OWNER (created only via /auth/register).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name, email, password, role]
+              properties:
+                name: { type: string, minLength: 2 }
+                email: { type: string, format: email }
+                password: { type: string, minLength: 8, format: password, description: Initial password — share it with the staff member out of band. }
+                role: { type: string, enum: [ADMIN, MANAGER, STAFF, RECEPTIONIST] }
+                phone: { type: string }
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties: { data: { $ref: '#/components/schemas/User' } }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /users/{id}:
+    get:
+      tags: [Staff]
+      summary: Get a staff member
+      parameters: [{ $ref: '#/components/parameters/IdParam' }]
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf: [{ $ref: '#/components/schemas/SuccessEnvelope' }, { type: object, properties: { data: { $ref: '#/components/schemas/User' } } }]
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    patch:
+      tags: [Staff]
+      summary: Update a staff member's name / phone / image
+      description: Requires OWNER, ADMIN, or MANAGER.
+      parameters: [{ $ref: '#/components/parameters/IdParam' }]
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name: { type: string, minLength: 2 }
+                phone: { type: string }
+                image: { type: string, format: uri }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf: [{ $ref: '#/components/schemas/SuccessEnvelope' }, { type: object, properties: { data: { $ref: '#/components/schemas/User' } } }]
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    delete:
+      tags: [Staff]
+      summary: Remove a staff member
+      description: Requires OWNER or ADMIN. The database rejects this (409) if the staff member has any appointment history — deactivate via PATCH /users/{id}/status instead.
+      parameters: [{ $ref: '#/components/parameters/IdParam' }]
+      responses:
+        '200':
+          description: OK
+          content: { application/json: { schema: { $ref: '#/components/schemas/MessageOnly' } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /users/{id}/role:
+    patch:
+      tags: [Staff]
+      summary: Change a staff member's role
+      description: Requires OWNER or ADMIN. Cannot change the owner's own role.
+      parameters: [{ $ref: '#/components/parameters/IdParam' }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [role]
+              properties: { role: { type: string, enum: [ADMIN, MANAGER, STAFF, RECEPTIONIST] } }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf: [{ $ref: '#/components/schemas/SuccessEnvelope' }, { type: object, properties: { data: { $ref: '#/components/schemas/User' } } }]
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /users/{id}/status:
+    patch:
+      tags: [Staff]
+      summary: Activate or deactivate a staff member
+      description: Requires OWNER, ADMIN, or MANAGER. The owner cannot be deactivated.
+      parameters: [{ $ref: '#/components/parameters/IdParam' }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, required: [isActive], properties: { isActive: { type: boolean } } }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf: [{ $ref: '#/components/schemas/SuccessEnvelope' }, { type: object, properties: { data: { $ref: '#/components/schemas/User' } } }]
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /users/{id}/services:
+    get:
+      tags: [Staff]
+      summary: Get the services this staff member performs
+      parameters: [{ $ref: '#/components/parameters/IdParam' }]
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf: [{ $ref: '#/components/schemas/SuccessEnvelope' }, { type: object, properties: { data: { type: array, items: { $ref: '#/components/schemas/StaffService' } } } }]
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    put:
+      tags: [Staff]
+      summary: Replace the full set of services this staff member performs
+      description: Requires OWNER, ADMIN, or MANAGER.
+      parameters: [{ $ref: '#/components/parameters/IdParam' }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [serviceIds]
+              properties: { serviceIds: { type: array, items: { type: string, format: uuid } } }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf: [{ $ref: '#/components/schemas/SuccessEnvelope' }, { type: object, properties: { data: { type: array, items: { $ref: '#/components/schemas/StaffService' } } } }]
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /customers/search:
+    get:
+      tags: [Customers]
+      summary: Search customers by name, email, or phone
+      parameters:
+        - name: q
+          in: query
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf: [{ $ref: '#/components/schemas/SuccessEnvelope' }, { type: object, properties: { data: { type: array, items: { $ref: '#/components/schemas/Customer' } } } }]
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /customers:
+    get:
+      tags: [Customers]
+      summary: List customers
+      parameters:
+        - $ref: '#/components/parameters/PageParam'
+        - $ref: '#/components/parameters/LimitParam'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf: [{ $ref: '#/components/schemas/SuccessEnvelope' }, { type: object, properties: { data: { type: array, items: { $ref: '#/components/schemas/Customer' } }, meta: { $ref: '#/components/schemas/PaginationMeta' } } }]
+        '401': { $ref: '#/components/responses/Unauthorized' }
+    post:
+      tags: [Customers]
+      summary: Create a customer
+      description: Requires OWNER, ADMIN, MANAGER, or RECEPTIONIST.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name: { type: string, minLength: 1 }
+                email: { type: string, format: email }
+                phone: { type: string }
+                notes: { type: string }
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema:
+                allOf: [{ $ref: '#/components/schemas/SuccessEnvelope' }, { type: object, properties: { data: { $ref: '#/components/schemas/Customer' } } }]
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /customers/{id}:
+    get:
+      tags: [Customers]
+      summary: Get a customer
+      parameters: [{ $ref: '#/components/parameters/IdParam' }]
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf: [{ $ref: '#/components/schemas/SuccessEnvelope' }, { type: object, properties: { data: { $ref: '#/components/schemas/Customer' } } }]
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    patch:
+      tags: [Customers]
+      summary: Update a customer
+      description: Requires OWNER, ADMIN, MANAGER, or RECEPTIONIST.
+      parameters: [{ $ref: '#/components/parameters/IdParam' }]
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name: { type: string }
+                email: { type: string, format: email }
+                phone: { type: string }
+                notes: { type: string }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf: [{ $ref: '#/components/schemas/SuccessEnvelope' }, { type: object, properties: { data: { $ref: '#/components/schemas/Customer' } } }]
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    delete:
+      tags: [Customers]
+      summary: Delete a customer
+      description: Requires OWNER, ADMIN, MANAGER, or RECEPTIONIST. Rejected (409) if the customer has appointment history.
+      parameters: [{ $ref: '#/components/parameters/IdParam' }]
+      responses:
+        '200':
+          description: OK
+          content: { application/json: { schema: { $ref: '#/components/schemas/MessageOnly' } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /customers/{id}/appointments:
+    get:
+      tags: [Customers]
+      summary: Get a customer's appointment history
+      parameters:
+        - $ref: '#/components/parameters/IdParam'
+        - $ref: '#/components/parameters/PageParam'
+        - $ref: '#/components/parameters/LimitParam'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf: [{ $ref: '#/components/schemas/SuccessEnvelope' }, { type: object, properties: { data: { type: array, items: { $ref: '#/components/schemas/Appointment' } }, meta: { $ref: '#/components/schemas/PaginationMeta' } } }]
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /service-categories:
+    get:
+      tags: [Service Categories]
+      summary: List service categories
+      parameters:
+        - $ref: '#/components/parameters/PageParam'
+        - $ref: '#/components/parameters/LimitParam'
+        - name: isActive
+          in: query
+          schema: { type: boolean }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf: [{ $ref: '#/components/schemas/SuccessEnvelope' }, { type: object, properties: { data: { type: array, items: { $ref: '#/components/schemas/ServiceCategory' } }, meta: { $ref: '#/components/schemas/PaginationMeta' } } }]
+        '401': { $ref: '#/components/responses/Unauthorized' }
+    post:
+      tags: [Service Categories]
+      summary: Create a category
+      description: Requires OWNER, ADMIN, or MANAGER.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, required: [name], properties: { name: { type: string }, description: { type: string } } }
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema:
+                allOf: [{ $ref: '#/components/schemas/SuccessEnvelope' }, { type: object, properties: { data: { $ref: '#/components/schemas/ServiceCategory' } } }]
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /service-categories/{id}:
+    get:
+      tags: [Service Categories]
+      summary: Get a category
+      parameters: [{ $ref: '#/components/parameters/IdParam' }]
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf: [{ $ref: '#/components/schemas/SuccessEnvelope' }, { type: object, properties: { data: { $ref: '#/components/schemas/ServiceCategory' } } }]
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    patch:
+      tags: [Service Categories]
+      summary: Update a category
+      description: Requires OWNER, ADMIN, or MANAGER.
+      parameters: [{ $ref: '#/components/parameters/IdParam' }]
+      requestBody:
+        content:
+          application/json:
+            schema: { type: object, properties: { name: { type: string }, description: { type: string } } }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf: [{ $ref: '#/components/schemas/SuccessEnvelope' }, { type: object, properties: { data: { $ref: '#/components/schemas/ServiceCategory' } } }]
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    delete:
+      tags: [Service Categories]
+      summary: Delete a category
+      description: Requires OWNER, ADMIN, or MANAGER. Services in this category have their categoryId set to null rather than being deleted.
+      parameters: [{ $ref: '#/components/parameters/IdParam' }]
+      responses:
+        '200':
+          description: OK
+          content: { application/json: { schema: { $ref: '#/components/schemas/MessageOnly' } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /service-categories/{id}/status:
+    patch:
+      tags: [Service Categories]
+      summary: Activate or deactivate a category
+      description: Requires OWNER, ADMIN, or MANAGER.
+      parameters: [{ $ref: '#/components/parameters/IdParam' }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, required: [isActive], properties: { isActive: { type: boolean } } }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf: [{ $ref: '#/components/schemas/SuccessEnvelope' }, { type: object, properties: { data: { $ref: '#/components/schemas/ServiceCategory' } } }]
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /service-categories/{id}/services:
+    get:
+      tags: [Service Categories]
+      summary: Get services in a category
+      parameters: [{ $ref: '#/components/parameters/IdParam' }]
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf: [{ $ref: '#/components/schemas/SuccessEnvelope' }, { type: object, properties: { data: { type: array, items: { $ref: '#/components/schemas/Service' } } } }]
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /services:
+    get:
+      tags: [Services]
+      summary: List services
+      parameters:
+        - $ref: '#/components/parameters/PageParam'
+        - $ref: '#/components/parameters/LimitParam'
+        - name: categoryId
+          in: query
+          schema: { type: string, format: uuid }
+        - name: isActive
+          in: query
+          schema: { type: boolean }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf: [{ $ref: '#/components/schemas/SuccessEnvelope' }, { type: object, properties: { data: { type: array, items: { $ref: '#/components/schemas/Service' } }, meta: { $ref: '#/components/schemas/PaginationMeta' } } }]
+        '401': { $ref: '#/components/responses/Unauthorized' }
+    post:
+      tags: [Services]
+      summary: Create a service
+      description: Requires OWNER, ADMIN, or MANAGER.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name, durationMinutes, price]
+              properties:
+                name: { type: string }
+                description: { type: string }
+                durationMinutes: { type: integer, minimum: 1, example: 45 }
+                bufferMinutes: { type: integer, minimum: 0, default: 0, example: 10 }
+                price: { type: number, minimum: 0, example: 30 }
+                categoryId: { type: string, format: uuid }
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema:
+                allOf: [{ $ref: '#/components/schemas/SuccessEnvelope' }, { type: object, properties: { data: { $ref: '#/components/schemas/Service' } } }]
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /services/{id}:
+    get:
+      tags: [Services]
+      summary: Get a service
+      parameters: [{ $ref: '#/components/parameters/IdParam' }]
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf: [{ $ref: '#/components/schemas/SuccessEnvelope' }, { type: object, properties: { data: { $ref: '#/components/schemas/Service' } } }]
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    patch:
+      tags: [Services]
+      summary: Update a service
+      description: Requires OWNER, ADMIN, or MANAGER.
+      parameters: [{ $ref: '#/components/parameters/IdParam' }]
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name: { type: string }
+                description: { type: string }
+                durationMinutes: { type: integer, minimum: 1 }
+                bufferMinutes: { type: integer, minimum: 0 }
+                price: { type: number, minimum: 0 }
+                categoryId: { type: string, format: uuid, nullable: true }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf: [{ $ref: '#/components/schemas/SuccessEnvelope' }, { type: object, properties: { data: { $ref: '#/components/schemas/Service' } } }]
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    delete:
+      tags: [Services]
+      summary: Delete a service
+      description: Requires OWNER, ADMIN, or MANAGER. Rejected (409) if the service has appointment history — deactivate via PATCH /services/{id}/status instead.
+      parameters: [{ $ref: '#/components/parameters/IdParam' }]
+      responses:
+        '200':
+          description: OK
+          content: { application/json: { schema: { $ref: '#/components/schemas/MessageOnly' } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /services/{id}/status:
+    patch:
+      tags: [Services]
+      summary: Activate or deactivate a service
+      description: Requires OWNER, ADMIN, or MANAGER.
+      parameters: [{ $ref: '#/components/parameters/IdParam' }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, required: [isActive], properties: { isActive: { type: boolean } } }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf: [{ $ref: '#/components/schemas/SuccessEnvelope' }, { type: object, properties: { data: { $ref: '#/components/schemas/Service' } } }]
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /services/{id}/staff:
+    get:
+      tags: [Services]
+      summary: Get staff who perform this service
+      parameters: [{ $ref: '#/components/parameters/IdParam' }]
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf: [{ $ref: '#/components/schemas/SuccessEnvelope' }, { type: object, properties: { data: { type: array, items: { $ref: '#/components/schemas/StaffService' } } } }]
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    put:
+      tags: [Services]
+      summary: Replace the full set of staff who perform this service
+      description: Requires OWNER, ADMIN, or MANAGER.
+      parameters: [{ $ref: '#/components/parameters/IdParam' }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, required: [staffIds], properties: { staffIds: { type: array, items: { type: string, format: uuid } } } }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf: [{ $ref: '#/components/schemas/SuccessEnvelope' }, { type: object, properties: { data: { type: array, items: { $ref: '#/components/schemas/StaffService' } } } }]
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /staff-services:
+    get:
+      tags: [Staff Services]
+      summary: List staff-service assignments
+      parameters:
+        - $ref: '#/components/parameters/PageParam'
+        - $ref: '#/components/parameters/LimitParam'
+        - name: staffId
+          in: query
+          schema: { type: string, format: uuid }
+        - name: serviceId
+          in: query
+          schema: { type: string, format: uuid }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf: [{ $ref: '#/components/schemas/SuccessEnvelope' }, { type: object, properties: { data: { type: array, items: { $ref: '#/components/schemas/StaffService' } }, meta: { $ref: '#/components/schemas/PaginationMeta' } } }]
+        '401': { $ref: '#/components/responses/Unauthorized' }
+    post:
+      tags: [Staff Services]
+      summary: Assign a service to a staff member
+      description: Requires OWNER, ADMIN, or MANAGER. Prefer this over the bulk PUT endpoints when you also need a custom price/duration for this one pairing.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [staffId, serviceId]
+              properties:
+                staffId: { type: string, format: uuid }
+                serviceId: { type: string, format: uuid }
+                customPrice: { type: number, minimum: 0 }
+                customDuration: { type: integer, minimum: 1 }
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema:
+                allOf: [{ $ref: '#/components/schemas/SuccessEnvelope' }, { type: object, properties: { data: { $ref: '#/components/schemas/StaffService' } } }]
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /staff-services/{id}:
+    get:
+      tags: [Staff Services]
+      summary: Get an assignment
+      parameters: [{ $ref: '#/components/parameters/IdParam' }]
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf: [{ $ref: '#/components/schemas/SuccessEnvelope' }, { type: object, properties: { data: { $ref: '#/components/schemas/StaffService' } } }]
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    patch:
+      tags: [Staff Services]
+      summary: Update custom price / duration / active status
+      description: Requires OWNER, ADMIN, or MANAGER.
+      parameters: [{ $ref: '#/components/parameters/IdParam' }]
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                customPrice: { type: number, minimum: 0, nullable: true }
+                customDuration: { type: integer, minimum: 1, nullable: true }
+                isActive: { type: boolean }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf: [{ $ref: '#/components/schemas/SuccessEnvelope' }, { type: object, properties: { data: { $ref: '#/components/schemas/StaffService' } } }]
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    delete:
+      tags: [Staff Services]
+      summary: Remove an assignment
+      description: Requires OWNER, ADMIN, or MANAGER.
+      parameters: [{ $ref: '#/components/parameters/IdParam' }]
+      responses:
+        '200':
+          description: OK
+          content: { application/json: { schema: { $ref: '#/components/schemas/MessageOnly' } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /working-hours:
+    get:
+      tags: [Working Hours]
+      summary: Get the business-level default weekly schedule
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf: [{ $ref: '#/components/schemas/SuccessEnvelope' }, { type: object, properties: { data: { type: array, items: { $ref: '#/components/schemas/WorkingHours' } } } }]
+        '401': { $ref: '#/components/responses/Unauthorized' }
+    post:
+      tags: [Working Hours]
+      summary: Add one day's hours
+      description: Requires OWNER, ADMIN, or MANAGER. Omit staffId for the business default. 409 if that day already has an entry — use PATCH, or PUT .../staff/{staffId} to replace a whole week at once.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [dayOfWeek, startTime, endTime]
+              properties:
+                staffId: { type: string, format: uuid }
+                dayOfWeek: { type: integer, minimum: 0, maximum: 6, description: "0 = Sunday .. 6 = Saturday" }
+                startTime: { type: string, example: "09:00", pattern: "^([01]\\d|2[0-3]):[0-5]\\d$" }
+                endTime: { type: string, example: "17:00", pattern: "^([01]\\d|2[0-3]):[0-5]\\d$" }
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema:
+                allOf: [{ $ref: '#/components/schemas/SuccessEnvelope' }, { type: object, properties: { data: { $ref: '#/components/schemas/WorkingHours' } } }]
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /working-hours/{id}:
+    patch:
+      tags: [Working Hours]
+      summary: Update one day's hours
+      description: Requires OWNER, ADMIN, or MANAGER.
+      parameters: [{ $ref: '#/components/parameters/IdParam' }]
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                startTime: { type: string, example: "09:00" }
+                endTime: { type: string, example: "17:00" }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf: [{ $ref: '#/components/schemas/SuccessEnvelope' }, { type: object, properties: { data: { $ref: '#/components/schemas/WorkingHours' } } }]
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    delete:
+      tags: [Working Hours]
+      summary: Remove one day's hours
+      description: Requires OWNER, ADMIN, or MANAGER.
+      parameters: [{ $ref: '#/components/parameters/IdParam' }]
+      responses:
+        '200':
+          description: OK
+          content: { application/json: { schema: { $ref: '#/components/schemas/MessageOnly' } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /working-hours/staff/{staffId}:
+    get:
+      tags: [Working Hours]
+      summary: Get a staff member's weekly schedule
+      parameters:
+        - name: staffId
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf: [{ $ref: '#/components/schemas/SuccessEnvelope' }, { type: object, properties: { data: { type: array, items: { $ref: '#/components/schemas/WorkingHours' } } } }]
+        '401': { $ref: '#/components/responses/Unauthorized' }
+    put:
+      tags: [Working Hours]
+      summary: Replace a staff member's entire weekly schedule
+      description: Requires OWNER, ADMIN, or MANAGER. Deletes and recreates all 7 (or fewer) days in one transaction — the easiest way to onboard a new staff member's schedule.
+      parameters:
+        - name: staffId
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [days]
+              properties:
+                days:
+                  type: array
+                  maxItems: 7
+                  items:
+                    type: object
+                    required: [dayOfWeek, startTime, endTime]
+                    properties:
+                      dayOfWeek: { type: integer, minimum: 0, maximum: 6 }
+                      startTime: { type: string, example: "09:00" }
+                      endTime: { type: string, example: "17:00" }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf: [{ $ref: '#/components/schemas/SuccessEnvelope' }, { type: object, properties: { data: { type: array, items: { $ref: '#/components/schemas/WorkingHours' } } } }]
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /schedule-overrides:
+    get:
+      tags: [Schedule Overrides]
+      summary: List schedule overrides
+      parameters:
+        - name: staffId
+          in: query
+          schema: { type: string, format: uuid }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf: [{ $ref: '#/components/schemas/SuccessEnvelope' }, { type: object, properties: { data: { type: array, items: { $ref: '#/components/schemas/ScheduleOverride' } } } }]
+        '401': { $ref: '#/components/responses/Unauthorized' }
+    post:
+      tags: [Schedule Overrides]
+      summary: Create an override
+      description: Requires OWNER, ADMIN, or MANAGER. Omit staffId for a business-wide override (e.g. a holiday). Set isClosed true, or provide startTime + endTime. 409 if that date already has an override.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [date]
+              properties:
+                staffId: { type: string, format: uuid }
+                date: { type: string, example: "2026-12-25" }
+                isClosed: { type: boolean, default: false }
+                startTime: { type: string, example: "10:00" }
+                endTime: { type: string, example: "15:00" }
+                reason: { type: string, example: Christmas }
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema:
+                allOf: [{ $ref: '#/components/schemas/SuccessEnvelope' }, { type: object, properties: { data: { $ref: '#/components/schemas/ScheduleOverride' } } }]
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /schedule-overrides/{id}:
+    get:
+      tags: [Schedule Overrides]
+      summary: Get an override
+      parameters: [{ $ref: '#/components/parameters/IdParam' }]
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf: [{ $ref: '#/components/schemas/SuccessEnvelope' }, { type: object, properties: { data: { $ref: '#/components/schemas/ScheduleOverride' } } }]
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    patch:
+      tags: [Schedule Overrides]
+      summary: Update an override
+      description: Requires OWNER, ADMIN, or MANAGER.
+      parameters: [{ $ref: '#/components/parameters/IdParam' }]
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                isClosed: { type: boolean }
+                startTime: { type: string }
+                endTime: { type: string }
+                reason: { type: string }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf: [{ $ref: '#/components/schemas/SuccessEnvelope' }, { type: object, properties: { data: { $ref: '#/components/schemas/ScheduleOverride' } } }]
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    delete:
+      tags: [Schedule Overrides]
+      summary: Remove an override
+      description: Requires OWNER, ADMIN, or MANAGER.
+      parameters: [{ $ref: '#/components/parameters/IdParam' }]
+      responses:
+        '200':
+          description: OK
+          content: { application/json: { schema: { $ref: '#/components/schemas/MessageOnly' } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /schedule-overrides/date/{date}:
+    get:
+      tags: [Schedule Overrides]
+      summary: Get overrides for a specific date
+      parameters:
+        - name: date
+          in: path
+          required: true
+          schema: { type: string, example: "2026-12-25" }
+        - name: staffId
+          in: query
+          schema: { type: string, format: uuid }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf: [{ $ref: '#/components/schemas/SuccessEnvelope' }, { type: object, properties: { data: { type: array, items: { $ref: '#/components/schemas/ScheduleOverride' } } } }]
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /blocked-times:
+    get:
+      tags: [Blocked Times]
+      summary: List blocked times
+      parameters:
+        - name: staffId
+          in: query
+          schema: { type: string, format: uuid }
+        - name: from
+          in: query
+          schema: { type: string, format: date-time }
+        - name: to
+          in: query
+          schema: { type: string, format: date-time }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf: [{ $ref: '#/components/schemas/SuccessEnvelope' }, { type: object, properties: { data: { type: array, items: { $ref: '#/components/schemas/BlockedTime' } } } }]
+        '401': { $ref: '#/components/responses/Unauthorized' }
+    post:
+      tags: [Blocked Times]
+      summary: Create a blocked time
+      description: Requires OWNER, ADMIN, or MANAGER. Omit staffId for a business-wide block.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [startAt, endAt]
+              properties:
+                staffId: { type: string, format: uuid }
+                startAt: { type: string, format: date-time }
+                endAt: { type: string, format: date-time }
+                reason: { type: string, example: Lunch }
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema:
+                allOf: [{ $ref: '#/components/schemas/SuccessEnvelope' }, { type: object, properties: { data: { $ref: '#/components/schemas/BlockedTime' } } }]
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /blocked-times/{id}:
+    get:
+      tags: [Blocked Times]
+      summary: Get a blocked time
+      parameters: [{ $ref: '#/components/parameters/IdParam' }]
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf: [{ $ref: '#/components/schemas/SuccessEnvelope' }, { type: object, properties: { data: { $ref: '#/components/schemas/BlockedTime' } } }]
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    patch:
+      tags: [Blocked Times]
+      summary: Update a blocked time
+      description: Requires OWNER, ADMIN, or MANAGER.
+      parameters: [{ $ref: '#/components/parameters/IdParam' }]
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                startAt: { type: string, format: date-time }
+                endAt: { type: string, format: date-time }
+                reason: { type: string }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf: [{ $ref: '#/components/schemas/SuccessEnvelope' }, { type: object, properties: { data: { $ref: '#/components/schemas/BlockedTime' } } }]
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    delete:
+      tags: [Blocked Times]
+      summary: Remove a blocked time
+      description: Requires OWNER, ADMIN, or MANAGER.
+      parameters: [{ $ref: '#/components/parameters/IdParam' }]
+      responses:
+        '200':
+          description: OK
+          content: { application/json: { schema: { $ref: '#/components/schemas/MessageOnly' } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /blocked-times/staff/{staffId}:
+    get:
+      tags: [Blocked Times]
+      summary: Get a staff member's blocked times
+      parameters:
+        - name: staffId
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf: [{ $ref: '#/components/schemas/SuccessEnvelope' }, { type: object, properties: { data: { type: array, items: { $ref: '#/components/schemas/BlockedTime' } } } }]
+        '401': { $ref: '#/components/responses/Unauthorized' }
+  /availability:
+    get:
+      tags: [Availability]
+      summary: Find available slots for a service
+      description: The core scheduling engine. Returns every eligible staff member's bookable slots for the given date.
+      parameters:
+        - name: serviceId
+          in: query
+          required: true
+          schema: { type: string, format: uuid }
+        - name: date
+          in: query
+          required: true
+          schema: { type: string, example: "2026-09-01" }
+        - name: staffId
+          in: query
+          schema: { type: string, format: uuid }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf: [{ $ref: '#/components/schemas/SuccessEnvelope' }, { type: object, properties: { data: { $ref: '#/components/schemas/AvailabilityResult' } } }]
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /availability/staff/{staffId}:
+    get:
+      tags: [Availability]
+      summary: Find available slots for one staff member
+      parameters:
+        - name: staffId
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+        - name: serviceId
+          in: query
+          required: true
+          schema: { type: string, format: uuid }
+        - name: date
+          in: query
+          required: true
+          schema: { type: string, example: "2026-09-01" }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf: [{ $ref: '#/components/schemas/SuccessEnvelope' }, { type: object, properties: { data: { $ref: '#/components/schemas/AvailabilityResult' } } }]
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /availability/service/{serviceId}:
+    get:
+      tags: [Availability]
+      summary: Find available staff/slots for a service (alternate path form)
+      parameters:
+        - name: serviceId
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+        - name: date
+          in: query
+          required: true
+          schema: { type: string, example: "2026-09-01" }
+        - name: staffId
+          in: query
+          schema: { type: string, format: uuid }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf: [{ $ref: '#/components/schemas/SuccessEnvelope' }, { type: object, properties: { data: { $ref: '#/components/schemas/AvailabilityResult' } } }]
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /appointments:
+    get:
+      tags: [Appointments]
+      summary: List appointments
+      description: STAFF-role callers always see only their own appointments, regardless of the staffId filter.
+      parameters:
+        - $ref: '#/components/parameters/PageParam'
+        - $ref: '#/components/parameters/LimitParam'
+        - name: date
+          in: query
+          schema: { type: string, example: "2026-09-01" }
+        - name: status
+          in: query
+          schema: { $ref: '#/components/schemas/AppointmentStatus' }
+        - name: staffId
+          in: query
+          schema: { type: string, format: uuid }
+        - name: customerId
+          in: query
+          schema: { type: string, format: uuid }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf: [{ $ref: '#/components/schemas/SuccessEnvelope' }, { type: object, properties: { data: { type: array, items: { $ref: '#/components/schemas/Appointment' } }, meta: { $ref: '#/components/schemas/PaginationMeta' } } }]
+        '401': { $ref: '#/components/responses/Unauthorized' }
+    post:
+      tags: [Appointments]
+      summary: Create an appointment
+      description: |
+        Requires OWNER, ADMIN, MANAGER, or RECEPTIONIST. Runs inside a
+        SERIALIZABLE transaction and re-validates working hours + conflicts
+        at write time — a prior /availability check is never trusted alone.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [customerId, staffId, serviceId, startAt]
+              properties:
+                customerId: { type: string, format: uuid }
+                staffId: { type: string, format: uuid }
+                serviceId: { type: string, format: uuid }
+                startAt: { type: string, format: date-time }
+                notes: { type: string }
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema:
+                allOf: [{ $ref: '#/components/schemas/SuccessEnvelope' }, { type: object, properties: { data: { $ref: '#/components/schemas/Appointment' } } }]
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409':
+          description: The slot is unavailable — outside working hours, blocked, or already booked.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              example: { success: false, error: { code: APPOINTMENT_CONFLICT, message: "This time slot conflicts with an existing appointment." } }
+
+  /appointments/{id}:
+    get:
+      tags: [Appointments]
+      summary: Get an appointment
+      parameters: [{ $ref: '#/components/parameters/IdParam' }]
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf: [{ $ref: '#/components/schemas/SuccessEnvelope' }, { type: object, properties: { data: { $ref: '#/components/schemas/Appointment' } } }]
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    patch:
+      tags: [Appointments]
+      summary: Update an appointment
+      description: Requires OWNER, ADMIN, MANAGER, or RECEPTIONIST. Changing staffId/serviceId/startAt re-validates availability (same conflict protection as creation); changing only notes does not.
+      parameters: [{ $ref: '#/components/parameters/IdParam' }]
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                staffId: { type: string, format: uuid }
+                serviceId: { type: string, format: uuid }
+                startAt: { type: string, format: date-time }
+                notes: { type: string }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf: [{ $ref: '#/components/schemas/SuccessEnvelope' }, { type: object, properties: { data: { $ref: '#/components/schemas/Appointment' } } }]
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+    delete:
+      tags: [Appointments]
+      summary: Delete an appointment
+      description: Requires OWNER, ADMIN, MANAGER, or RECEPTIONIST. Rejected (409) if a payment record exists — cancel it instead (POST /appointments/{id}/cancel).
+      parameters: [{ $ref: '#/components/parameters/IdParam' }]
+      responses:
+        '200':
+          description: OK
+          content: { application/json: { schema: { $ref: '#/components/schemas/MessageOnly' } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /appointments/{id}/status:
+    patch:
+      tags: [Appointments]
+      summary: Change appointment status directly
+      description: |
+        Requires OWNER, ADMIN, MANAGER, or RECEPTIONIST. Only certain
+        transitions are allowed: PENDING -> CONFIRMED/CANCELLED/NO_SHOW,
+        CONFIRMED -> COMPLETED/CANCELLED/NO_SHOW. COMPLETED/CANCELLED/NO_SHOW
+        are terminal. Prefer the dedicated /cancel, /confirm, /complete,
+        /no-show endpoints below for clarity.
+      parameters: [{ $ref: '#/components/parameters/IdParam' }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, required: [status], properties: { status: { $ref: '#/components/schemas/AppointmentStatus' } } }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf: [{ $ref: '#/components/schemas/SuccessEnvelope' }, { type: object, properties: { data: { $ref: '#/components/schemas/Appointment' } } }]
+        '400':
+          description: Invalid transition, or validation error.
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /appointments/{id}/cancel:
+    post:
+      tags: [Appointments]
+      summary: Cancel an appointment
+      description: Requires OWNER, ADMIN, MANAGER, or RECEPTIONIST. Sets cancelledAt and, if provided, cancellationReason. Does not automatically refund — use POST /payments/{id}/refund separately if needed.
+      parameters: [{ $ref: '#/components/parameters/IdParam' }]
+      requestBody:
+        content:
+          application/json:
+            schema: { type: object, properties: { reason: { type: string } } }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf: [{ $ref: '#/components/schemas/SuccessEnvelope' }, { type: object, properties: { data: { $ref: '#/components/schemas/Appointment' } } }]
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /appointments/{id}/confirm:
+    post:
+      tags: [Appointments]
+      summary: Confirm a pending appointment
+      description: Requires OWNER, ADMIN, MANAGER, or RECEPTIONIST.
+      parameters: [{ $ref: '#/components/parameters/IdParam' }]
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf: [{ $ref: '#/components/schemas/SuccessEnvelope' }, { type: object, properties: { data: { $ref: '#/components/schemas/Appointment' } } }]
+        '400': { description: Invalid transition., content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /appointments/{id}/complete:
+    post:
+      tags: [Appointments]
+      summary: Mark an appointment completed
+      description: Requires OWNER, ADMIN, MANAGER, or RECEPTIONIST.
+      parameters: [{ $ref: '#/components/parameters/IdParam' }]
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf: [{ $ref: '#/components/schemas/SuccessEnvelope' }, { type: object, properties: { data: { $ref: '#/components/schemas/Appointment' } } }]
+        '400': { description: Invalid transition., content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /appointments/{id}/no-show:
+    post:
+      tags: [Appointments]
+      summary: Mark an appointment as a no-show
+      description: Requires OWNER, ADMIN, MANAGER, or RECEPTIONIST.
+      parameters: [{ $ref: '#/components/parameters/IdParam' }]
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf: [{ $ref: '#/components/schemas/SuccessEnvelope' }, { type: object, properties: { data: { $ref: '#/components/schemas/Appointment' } } }]
+        '400': { description: Invalid transition., content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /appointments/{id}/payment:
+    get:
+      tags: [Appointments]
+      summary: Get an appointment's payment records
+      parameters: [{ $ref: '#/components/parameters/IdParam' }]
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf: [{ $ref: '#/components/schemas/SuccessEnvelope' }, { type: object, properties: { data: { type: array, items: { $ref: '#/components/schemas/Payment' } } } }]
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /appointments/date/{date}:
+    get:
+      tags: [Appointments]
+      summary: Get appointments for a date
+      parameters:
+        - name: date
+          in: path
+          required: true
+          schema: { type: string, example: "2026-09-01" }
+        - $ref: '#/components/parameters/PageParam'
+        - $ref: '#/components/parameters/LimitParam'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf: [{ $ref: '#/components/schemas/SuccessEnvelope' }, { type: object, properties: { data: { type: array, items: { $ref: '#/components/schemas/Appointment' } }, meta: { $ref: '#/components/schemas/PaginationMeta' } } }]
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /appointments/staff/{staffId}:
+    get:
+      tags: [Appointments]
+      summary: Get a staff member's appointments
+      description: STAFF-role callers may only request their own staffId.
+      parameters:
+        - name: staffId
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+        - $ref: '#/components/parameters/PageParam'
+        - $ref: '#/components/parameters/LimitParam'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf: [{ $ref: '#/components/schemas/SuccessEnvelope' }, { type: object, properties: { data: { type: array, items: { $ref: '#/components/schemas/Appointment' } }, meta: { $ref: '#/components/schemas/PaginationMeta' } } }]
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /appointments/customer/{customerId}:
+    get:
+      tags: [Appointments]
+      summary: Get a customer's appointments
+      parameters:
+        - name: customerId
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+        - $ref: '#/components/parameters/PageParam'
+        - $ref: '#/components/parameters/LimitParam'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf: [{ $ref: '#/components/schemas/SuccessEnvelope' }, { type: object, properties: { data: { type: array, items: { $ref: '#/components/schemas/Appointment' } }, meta: { $ref: '#/components/schemas/PaginationMeta' } } }]
+        '401': { $ref: '#/components/responses/Unauthorized' }
+  /public/business/{slug}:
+    get:
+      tags: [Public Booking]
+      summary: Get public business info
+      security: []
+      parameters:
+        - name: slug
+          in: path
+          required: true
+          schema: { type: string, example: apex-barbers }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf: [{ $ref: '#/components/schemas/SuccessEnvelope' }, { type: object, properties: { data: { $ref: '#/components/schemas/PublicBusiness' } } }]
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /public/business/{slug}/categories:
+    get:
+      tags: [Public Booking]
+      summary: Get active service categories
+      security: []
+      parameters:
+        - name: slug
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf: [{ $ref: '#/components/schemas/SuccessEnvelope' }, { type: object, properties: { data: { type: array, items: { $ref: '#/components/schemas/ServiceCategory' } } } }]
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /public/business/{slug}/services:
+    get:
+      tags: [Public Booking]
+      summary: Get active services
+      security: []
+      parameters:
+        - name: slug
+          in: path
+          required: true
+          schema: { type: string }
+        - name: categoryId
+          in: query
+          schema: { type: string, format: uuid }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf: [{ $ref: '#/components/schemas/SuccessEnvelope' }, { type: object, properties: { data: { type: array, items: { $ref: '#/components/schemas/Service' } } } }]
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /public/business/{slug}/staff:
+    get:
+      tags: [Public Booking]
+      summary: Get active staff, optionally filtered to those performing a service
+      security: []
+      parameters:
+        - name: slug
+          in: path
+          required: true
+          schema: { type: string }
+        - name: serviceId
+          in: query
+          schema: { type: string, format: uuid }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf: [{ $ref: '#/components/schemas/SuccessEnvelope' }, { type: object, properties: { data: { type: array, items: { type: object, properties: { id: { type: string, format: uuid }, name: { type: string }, image: { type: string, nullable: true } } } } } }]
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /public/business/{slug}/availability:
+    get:
+      tags: [Public Booking]
+      summary: Find available booking slots
+      security: []
+      parameters:
+        - name: slug
+          in: path
+          required: true
+          schema: { type: string }
+        - name: serviceId
+          in: query
+          required: true
+          schema: { type: string, format: uuid }
+        - name: date
+          in: query
+          required: true
+          schema: { type: string, example: "2026-09-01" }
+        - name: staffId
+          in: query
+          schema: { type: string, format: uuid }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf: [{ $ref: '#/components/schemas/SuccessEnvelope' }, { type: object, properties: { data: { $ref: '#/components/schemas/AvailabilityResult' } } }]
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /public/business/{slug}/appointments:
+    post:
+      tags: [Public Booking]
+      summary: Create a booking
+      description: |
+        Unauthenticated — this is what the customer-facing booking page
+        calls. Finds-or-creates the Customer by email, then goes through
+        the exact same conflict/working-hours validation as an
+        authenticated booking. Rate-limited to 30/hour per IP.
+      security: []
+      parameters:
+        - name: slug
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [serviceId, staffId, startAt, customer]
+              properties:
+                serviceId: { type: string, format: uuid }
+                staffId: { type: string, format: uuid }
+                startAt: { type: string, format: date-time }
+                notes: { type: string }
+                customer:
+                  type: object
+                  required: [name]
+                  properties:
+                    name: { type: string }
+                    email: { type: string, format: email }
+                    phone: { type: string }
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema:
+                allOf: [{ $ref: '#/components/schemas/SuccessEnvelope' }, { type: object, properties: { data: { $ref: '#/components/schemas/Appointment' } } }]
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: The slot is unavailable — outside working hours, blocked, or already booked.
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /payments/create-intent:
+    post:
+      tags: [Payments]
+      summary: Create a Stripe PaymentIntent for an appointment
+      description: |
+        Unauthenticated — the customer paying from the booking page has no
+        staff account. Only works against a real, unpaid appointmentId.
+        Rate-limited to 30/hour per IP.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, required: [appointmentId], properties: { appointmentId: { type: string, format: uuid } } }
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema:
+                allOf: [{ $ref: '#/components/schemas/SuccessEnvelope' }, { type: object, properties: { data: { type: object, properties: { clientSecret: { type: string, description: Pass to Stripe.js on the frontend to collect card details. } } } } }]
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: This appointment has already been paid.
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /payments:
+    get:
+      tags: [Payments]
+      summary: List payments
+      description: Requires OWNER, ADMIN, MANAGER, or RECEPTIONIST.
+      parameters:
+        - $ref: '#/components/parameters/PageParam'
+        - $ref: '#/components/parameters/LimitParam'
+        - name: status
+          in: query
+          schema: { $ref: '#/components/schemas/PaymentStatus' }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf: [{ $ref: '#/components/schemas/SuccessEnvelope' }, { type: object, properties: { data: { type: array, items: { $ref: '#/components/schemas/Payment' } }, meta: { $ref: '#/components/schemas/PaginationMeta' } } }]
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+    post:
+      tags: [Payments]
+      summary: Record a manual payment
+      description: Requires OWNER, ADMIN, MANAGER, or RECEPTIONIST. Typically CASH taken in person — CARD payments normally arrive via the Stripe webhook instead.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [appointmentId, amount, method]
+              properties:
+                appointmentId: { type: string, format: uuid }
+                amount: { type: number, minimum: 0 }
+                method: { $ref: '#/components/schemas/PaymentMethod' }
+                transactionRef: { type: string }
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema:
+                allOf: [{ $ref: '#/components/schemas/SuccessEnvelope' }, { type: object, properties: { data: { $ref: '#/components/schemas/Payment' } } }]
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /payments/{id}:
+    get:
+      tags: [Payments]
+      summary: Get a payment
+      description: Requires OWNER, ADMIN, MANAGER, or RECEPTIONIST.
+      parameters: [{ $ref: '#/components/parameters/IdParam' }]
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf: [{ $ref: '#/components/schemas/SuccessEnvelope' }, { type: object, properties: { data: { $ref: '#/components/schemas/Payment' } } }]
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    patch:
+      tags: [Payments]
+      summary: Update a payment record
+      description: Requires OWNER, ADMIN, MANAGER, or RECEPTIONIST. CARD payment status cannot be edited here (it's driven by the Stripe webhook) — use the refund endpoint instead.
+      parameters: [{ $ref: '#/components/parameters/IdParam' }]
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                status: { $ref: '#/components/schemas/PaymentStatus' }
+                transactionRef: { type: string }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf: [{ $ref: '#/components/schemas/SuccessEnvelope' }, { type: object, properties: { data: { $ref: '#/components/schemas/Payment' } } }]
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /payments/{id}/refund:
+    post:
+      tags: [Payments]
+      summary: Refund a payment
+      description: Requires OWNER, ADMIN, or MANAGER. For CARD payments this calls the Stripe Refunds API; for CASH it just updates the record. Omit amount for a full refund.
+      parameters: [{ $ref: '#/components/parameters/IdParam' }]
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                amount: { type: number, minimum: 0, description: Omit for a full refund. }
+                reason: { type: string, enum: [duplicate, fraudulent, requested_by_customer] }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf: [{ $ref: '#/components/schemas/SuccessEnvelope' }, { type: object, properties: { data: { $ref: '#/components/schemas/Payment' } } }]
+        '400':
+          description: Only a paid payment can be refunded.
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /payments/appointment/{appointmentId}:
+    get:
+      tags: [Payments]
+      summary: Get payments for an appointment
+      description: Requires OWNER, ADMIN, MANAGER, or RECEPTIONIST.
+      parameters:
+        - name: appointmentId
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf: [{ $ref: '#/components/schemas/SuccessEnvelope' }, { type: object, properties: { data: { type: array, items: { $ref: '#/components/schemas/Payment' } } } }]
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /payments/webhook:
+    post:
+      tags: [Payments]
+      summary: Stripe webhook (Stripe calls this — not for direct use)
+      description: |
+        Verifies the `Stripe-Signature` header against the raw request body.
+        Registered ahead of JSON body parsing in app.js for that reason.
+        The only place a CARD payment is ever marked PAID.
+      security: []
+      parameters:
+        - name: Stripe-Signature
+          in: header
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: string, format: binary, description: Raw Stripe event payload. }
+      responses:
+        '200':
+          description: Event processed (or safely ignored).
+          content: { application/json: { schema: { type: object, properties: { received: { type: boolean } } } } }
+        '400':
+          description: Signature verification failed.
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+
+  /dashboard/overview:
+    get:
+      tags: [Dashboard]
+      summary: Headline stats for today
+      description: Requires OWNER, ADMIN, or MANAGER.
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf: [{ $ref: '#/components/schemas/SuccessEnvelope' }, { type: object, properties: { data: { type: object, properties: { todayAppointments: { type: integer }, completedAppointments: { type: integer }, pendingAppointments: { type: integer }, revenueToday: { type: string }, totalCustomers: { type: integer } } } } }]
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /dashboard/today:
+    get:
+      tags: [Dashboard]
+      summary: Today's appointments
+      description: Requires OWNER, ADMIN, or MANAGER.
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf: [{ $ref: '#/components/schemas/SuccessEnvelope' }, { type: object, properties: { data: { type: array, items: { $ref: '#/components/schemas/Appointment' } } } }]
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /dashboard/revenue:
+    get:
+      tags: [Dashboard]
+      summary: Revenue totals
+      description: Requires OWNER, ADMIN, or MANAGER.
+      parameters:
+        - name: from
+          in: query
+          schema: { type: string, format: date-time }
+        - name: to
+          in: query
+          schema: { type: string, format: date-time }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf: [{ $ref: '#/components/schemas/SuccessEnvelope' }, { type: object, properties: { data: { type: object, properties: { totalRevenue: { type: string }, paymentCount: { type: integer } } } } }]
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /dashboard/appointments:
+    get:
+      tags: [Dashboard]
+      summary: Appointment counts by status
+      description: Requires OWNER, ADMIN, or MANAGER.
+      parameters:
+        - name: from
+          in: query
+          schema: { type: string, format: date-time }
+        - name: to
+          in: query
+          schema: { type: string, format: date-time }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf: [{ $ref: '#/components/schemas/SuccessEnvelope' }, { type: object, properties: { data: { type: object, properties: { total: { type: integer }, byStatus: { type: object, additionalProperties: { type: integer }, example: { CONFIRMED: 12, COMPLETED: 40 } } } } } }]
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /dashboard/customers:
+    get:
+      tags: [Dashboard]
+      summary: Customer stats
+      description: Requires OWNER, ADMIN, or MANAGER.
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf: [{ $ref: '#/components/schemas/SuccessEnvelope' }, { type: object, properties: { data: { type: object, properties: { total: { type: integer }, newLast30Days: { type: integer } } } } }]
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /dashboard/services:
+    get:
+      tags: [Dashboard]
+      summary: Completed-appointment counts by service
+      description: Requires OWNER, ADMIN, or MANAGER.
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf: [{ $ref: '#/components/schemas/SuccessEnvelope' }, { type: object, properties: { data: { type: array, items: { type: object, properties: { service: { $ref: '#/components/schemas/Service' }, completedCount: { type: integer } } } } } }]
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /dashboard/staff:
+    get:
+      tags: [Dashboard]
+      summary: Completed-appointment counts by staff member
+      description: Requires OWNER, ADMIN, or MANAGER.
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf: [{ $ref: '#/components/schemas/SuccessEnvelope' }, { type: object, properties: { data: { type: array, items: { type: object, properties: { staff: { type: object, properties: { id: { type: string, format: uuid }, name: { type: string } } }, completedCount: { type: integer } } } } } }]
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /health:
+    get:
+      tags: [Health]
+      summary: Service and database health
+      security: []
+      responses:
+        '200':
+          description: Healthy
+          content:
+            application/json:
+              schema:
+                allOf: [{ $ref: '#/components/schemas/SuccessEnvelope' }, { type: object, properties: { data: { type: object, properties: { status: { type: string, example: ok }, database: { type: string, example: ok }, environment: { type: string, example: development }, timestamp: { type: string, format: date-time } } } } }]
+        '503':
+          description: Database unreachable
+          content:
+            application/json:
+              schema:
+                allOf: [{ $ref: '#/components/schemas/SuccessEnvelope' }, { type: object, properties: { data: { type: object, properties: { status: { type: string, example: error }, database: { type: string, example: error } } } } }]

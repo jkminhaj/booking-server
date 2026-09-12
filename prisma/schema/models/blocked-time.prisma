@@ -1,0 +1,17 @@
+model BlockedTime {
+  id String @id @default(uuid())
+
+  businessId String   @map("business_id")
+  business   Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+
+  staffId String? @map("staff_id")
+  staff   User?   @relation(fields: [staffId], references: [id], onDelete: Cascade)
+
+  startAt DateTime @map("start_at")
+  endAt   DateTime @map("end_at")
+  reason  String?
+
+  @@index([businessId, startAt])
+  @@index([staffId, startAt])
+  @@map("blocked_times")
+}

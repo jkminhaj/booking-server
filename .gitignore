@@ -4,11 +4,14 @@ node_modules/
 # Environment Variables
 .env
 
-# Generated Prisma Client
-/src/generated/prisma/
+# Generated Prisma files
+/src/generated/
 
 # Editor / AI tool config
 .vscode/
 .windsurf/
 .claude/
 .agents/
+
+# AI/tool generated lock file
+skills-lock.json

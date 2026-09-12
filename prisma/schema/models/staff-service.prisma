@@ -1,0 +1,16 @@
+model StaffService {
+  id String @id @default(uuid())
+
+  staffId String @map("staff_id")
+  staff   User   @relation(fields: [staffId], references: [id], onDelete: Cascade)
+
+  serviceId String  @map("service_id")
+  service   Service @relation(fields: [serviceId], references: [id], onDelete: Cascade)
+
+  customPrice    Decimal? @map("custom_price") @db.Decimal(10, 2)
+  customDuration Int?     @map("custom_duration")
+  isActive       Boolean  @default(true) @map("is_active")
+
+  @@unique([staffId, serviceId])
+  @@map("staff_services")
+}

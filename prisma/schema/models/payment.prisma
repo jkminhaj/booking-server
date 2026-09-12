@@ -1,0 +1,20 @@
+model Payment {
+  id String @id @default(uuid())
+
+  appointmentId String      @map("appointment_id")
+  appointment   Appointment @relation(fields: [appointmentId], references: [id], onDelete: Restrict)
+
+  amount Decimal @db.Decimal(10, 2)
+
+  status PaymentStatus @default(PENDING)
+  method PaymentMethod
+
+  transactionRef String?   @map("transaction_ref")
+  paidAt         DateTime? @map("paid_at")
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@index([appointmentId])
+  @@map("payments")
+}

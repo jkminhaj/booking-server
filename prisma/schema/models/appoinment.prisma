@@ -1,0 +1,37 @@
+model Appointment {
+  id String @id @default(uuid())
+
+  businessId String   @map("business_id")
+  business   Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+
+  customerId String   @map("customer_id")
+  customer   Customer @relation(fields: [customerId], references: [id], onDelete: Restrict)
+
+  staffId String @map("staff_id")
+  staff   User   @relation(fields: [staffId], references: [id], onDelete: Restrict)
+
+  serviceId String  @map("service_id")
+  service   Service @relation(fields: [serviceId], references: [id], onDelete: Restrict)
+
+  startAt DateTime @map("start_at")
+  endAt   DateTime @map("end_at")
+
+  status AppointmentStatus @default(PENDING)
+
+  priceAtBooking Decimal @map("price_at_booking") @db.Decimal(10, 2)
+
+  notes String?
+
+  cancelledAt        DateTime? @map("cancelled_at")
+  cancellationReason String?   @map("cancellation_reason")
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  payments Payment[]
+
+  @@index([businessId, startAt])
+  @@index([staffId, startAt])
+  @@index([customerId])
+  @@map("appointments")
+}

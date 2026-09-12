@@ -1,0 +1,19 @@
+model ScheduleOverride {
+  id String @id @default(uuid())
+
+  businessId String   @map("business_id")
+  business   Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+
+  staffId String? @map("staff_id")
+  staff   User?   @relation(fields: [staffId], references: [id], onDelete: Cascade)
+
+  date      DateTime  @db.Date
+  startTime DateTime? @map("start_time") @db.Time
+  endTime   DateTime? @map("end_time") @db.Time
+  isClosed  Boolean   @default(false) @map("is_closed")
+  reason    String?
+
+  @@index([businessId, date])
+  @@index([staffId, date])
+  @@map("schedule_overrides")
+}

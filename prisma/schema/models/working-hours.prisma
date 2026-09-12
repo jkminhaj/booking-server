@@ -1,0 +1,18 @@
+model WorkingHours {
+  id String @id @default(uuid())
+
+  businessId String   @map("business_id")
+  business   Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+
+  staffId String? @map("staff_id")
+  staff   User?   @relation(fields: [staffId], references: [id], onDelete: Cascade)
+
+  dayOfWeek Int @map("day_of_week") // 0 = Sunday ... 6 = Saturday
+
+  startTime DateTime? @map("start_time") @db.Time
+  endTime   DateTime? @map("end_time") @db.Time
+
+  @@index([businessId, dayOfWeek])
+  @@index([staffId, dayOfWeek])
+  @@map("working_hours")
+}

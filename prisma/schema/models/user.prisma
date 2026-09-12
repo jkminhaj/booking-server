@@ -1,20 +1,30 @@
 model User {
-    id         String @id @default(uuid())
-    firebaseId String @unique
+  id         String   @id @default(uuid())
+  businessId String   @map("business_id")
+  business   Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
 
-    fullName  String
-    email     String  @unique
-    username  String? @unique
-    phone     String?
-    // role UserRole
-    avatarUrl String?
+  // Optional: only set if/when Firebase (or another OAuth-style provider) login is added later.
+  firebaseId String? @unique
+  name       String
+  email      String  @unique
+  // bcrypt hash — never the plaintext password, never returned by the API.
+  passwordHash String @map("password_hash")
+  phone      String?
+  image      String?
+  role       Role
+  // Bumped on logout / password change to invalidate all previously-issued refresh tokens.
+  tokenVersion Int @default(0) @map("token_version")
 
-    createdAt DateTime @default(now())
-    updatedAt DateTime @updatedAt
+  isActive  Boolean  @default(true) @map("is_active")
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
 
-    //   Upcoming realations 
-    // appoinments
+  staffServices     StaffService[]
+  workingHours      WorkingHours[]
+  scheduleOverrides ScheduleOverride[]
+  blockedTimes      BlockedTime[]
+  appointments      Appointment[]
 
-} 
-
-
+  @@index([businessId])
+  @@map("users")
+}

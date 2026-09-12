@@ -1,0 +1,25 @@
+model Service {
+  id         String   @id @default(uuid())
+  businessId String   @map("business_id")
+  business   Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+
+  categoryId String?          @map("category_id")
+  category   ServiceCategory? @relation(fields: [categoryId], references: [id], onDelete: SetNull)
+
+  name            String
+  description     String?
+  durationMinutes Int     @map("duration_minutes")
+  bufferMinutes   Int     @default(0) @map("buffer_minutes")
+  price           Decimal @db.Decimal(10, 2)
+  isActive        Boolean @default(true) @map("is_active")
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  staffServices StaffService[]
+  appointments  Appointment[]
+
+  @@index([businessId])
+  @@index([categoryId])
+  @@map("services")
+}
